@@ -49,15 +49,10 @@ import org.keycloak.storage.user.UserLookupProvider;
 import org.keycloak.storage.user.UserQueryProvider;
 import org.keycloak.storage.user.UserRegistrationProvider;
 
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 
 import static org.keycloak.models.utils.KeycloakModelUtils.runJobInTransaction;
+import static org.keycloak.models.utils.KeycloakModelUtils.setupOfflineRole;
 
 /**
  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
@@ -467,7 +462,7 @@ public class UserStorageManager implements UserProvider, OnUserCache, OnCreateCo
         List<UserModel> query(Object provider, int first, int max);
     }
 
-    protected List<UserModel> query(PaginatedQuery pagedQuery, RealmModel realm, int firstResult, int maxResults) {
+    protected List<UserModel> query(PaginatedQuery pagedQuery, RealmModel realm, int firstResult, int maxResults, boolean includeServiceAccounts) {
         if (maxResults == 0) return Collections.EMPTY_LIST;
         if (firstResult < 0) firstResult = 0;
         if (maxResults < 0) maxResults = Integer.MAX_VALUE - 1;
@@ -478,37 +473,51 @@ public class UserStorageManager implements UserProvider, OnUserCache, OnCreateCo
             return pagedQuery.query(localStorage(), firstResult, maxResults);
         }
         LinkedList<Object> providers = new LinkedList<>();
+        List<UserQueryProvider> userQueryProviders = new LinkedList<>();
         List<UserModel> results = new LinkedList<UserModel>();
         providers.add(localStorage());
         providers.addAll(storageProviders);
         if (getFederatedStorage() != null) providers.add(getFederatedStorage());
 
-        int leftToRead = maxResults;
-        int leftToFirstResult = firstResult;
-
-        Iterator<Object> it = providers.iterator();
-        while (it.hasNext() && leftToRead != 0) {
-            Object provider = it.next();
-            boolean exhausted = false;
-            int index = 0;
-            if (leftToFirstResult > 0) {
-                do {
-                    int toRead = Math.min(50, leftToFirstResult);
-                    List<UserModel> tmp = pagedQuery.query(provider, index, toRead);
-                    leftToFirstResult -= tmp.size();
-                    index += tmp.size();
-                    if (tmp.size() < toRead) {
-                        exhausted = true;
-                        break;
-                    }
-                } while (leftToFirstResult > 0);
+        providers.forEach(provider -> {
+            if(provider instanceof UserQueryProvider) {
+                userQueryProviders.add((UserQueryProvider)provider);
             }
-            if (exhausted) continue;
-            List<UserModel> tmp = pagedQuery.query(provider, index, leftToRead);
-            results.addAll(tmp);
-            if (leftToRead > 0) leftToRead -= tmp.size();
+        });
+        // get starting point
+        Iterator<UserQueryProvider> itUQP = userQueryProviders.iterator();
+        int count = 0;
+        UserQueryProvider currentUQP = null;
+        while(itUQP.hasNext() && count < firstResult+1) { // firstResult + 1 := Anzahl bis zu diesem Result
+            currentUQP = itUQP.next();
+            if(currentUQP instanceof UserProvider) {
+                count += currentUQP.getUsersCount(realm, includeServiceAccounts);
+            } else {
+                count += currentUQP.getUsersCount(realm);
+            }
+            if(count < firstResult+1) {
+                firstResult -= count;
+            }
         }
 
+        // there are no providers
+        if(currentUQP == null) {
+            return Collections.EMPTY_LIST;
+        }
+
+        // found starting point
+        int leftToRead = maxResults;
+        while(leftToRead > 0) {
+            List<UserModel> tmp = pagedQuery.query(currentUQP, firstResult, leftToRead);
+            leftToRead -= tmp.size();
+            System.err.println("Found: " + tmp.size() + "    LeftToRead: " + leftToRead);
+            results.addAll(tmp);
+            if(!itUQP.hasNext()) {
+                // last provider passed
+                break;
+            }
+            currentUQP = itUQP.next();
+        }
         return results;
     }
 
@@ -523,7 +532,7 @@ public class UserStorageManager implements UserProvider, OnUserCache, OnCreateCo
             }
             return Collections.EMPTY_LIST;
         }
-        , realm, firstResult, maxResults);
+        , realm, firstResult, maxResults, includeServiceAccounts);
         return importValidation(realm, results);
     }
 
@@ -540,7 +549,7 @@ public class UserStorageManager implements UserProvider, OnUserCache, OnCreateCo
 
             }
             return Collections.EMPTY_LIST;
-        }, realm, firstResult, maxResults);
+        }, realm, firstResult, maxResults, false);
         return importValidation(realm, results);
 
     }
@@ -560,7 +569,7 @@ public class UserStorageManager implements UserProvider, OnUserCache, OnCreateCo
             }
             return Collections.EMPTY_LIST;
         }
-        , realm, firstResult, maxResults);
+        , realm, firstResult, maxResults, false);
         return importValidation(realm, results);
 
     }
@@ -582,7 +591,7 @@ public class UserStorageManager implements UserProvider, OnUserCache, OnCreateCo
 
             }
             return Collections.EMPTY_LIST;
-        }, realm,0, Integer.MAX_VALUE - 1);
+        }, realm,0, Integer.MAX_VALUE - 1, false);
         return importValidation(realm, results);
     }
 
@@ -636,7 +645,7 @@ public class UserStorageManager implements UserProvider, OnUserCache, OnCreateCo
 
             }
             return Collections.EMPTY_LIST;
-        }, realm, firstResult, maxResults);
+        }, realm, firstResult, maxResults, false);
         return importValidation(realm, results);
     }
 
@@ -647,7 +656,7 @@ public class UserStorageManager implements UserProvider, OnUserCache, OnCreateCo
                 return ((UserQueryProvider)provider).getRoleMembers(realm, role, first, max);
             } 
             return Collections.EMPTY_LIST;
-        }, realm, firstResult, maxResults);
+        }, realm, firstResult, maxResults, false);
         return importValidation(realm, results);
     }
 
